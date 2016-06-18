@@ -1,0 +1,103 @@
+#!/usr/bin/python2
+
+import sys
+from time import sleep
+from string import Template
+from subprocess import check_output, CalledProcessError
+from constants import *
+
+
+# read a given file contains list of peer ips
+# formatted as one ip per line
+def read_all_peers(filename):
+    with open(filename, 'r') as hosts:
+        return map( (lambda str: str.strip()), hosts.readlines())
+
+
+
+class env_builder:
+    def __init__(self, user='lxylinki', port=PORT, origin=ORIGIN_IP, name=None, key=None):
+    #def __init__(self, user='lxylinki', key=None):
+        self.usrname = user
+        self.port = port
+        self.orig = origin
+        self.name = name
+        #self.cdn_work_dir = '/home/{}/'.format(self.usrname)
+
+        self.priv_key = key
+
+        # all arguments provided
+        if key is not None:
+            #self.run_dns_temp = Template('ssh -i $key $usrname@$remote_host ./dnsserver -p $dnsport -n $dnsname && exit')
+            self.run_dns_temp = Template('ssh -i $key $usrname@$remote_host sh nohup.sh ./dnsserver -p $dnsport -n $dnsname && exit')
+            self.run_http_temp = Template('ssh -i $key $usrname@$remote_host sh nohup.sh ./httpserver -p $httpport -o $httporig && exit')
+
+        # default case
+        else:
+            #self.run_dns_temp = Template('ssh $usrname@$remote_host ./dnsserver && exit')
+            self.run_dns_temp = Template('ssh $usrname@$remote_host sh nohup.sh ./dnsserver && exit')
+            self.run_http_temp = Template('ssh $usrname@$remote_host sh nohup.sh ./httpserver && exit')
+
+        self.peers = read_all_peers(HOSTS)
+
+
+    def run_dnsserver_at(self, peer_ip):
+        print ('Invoking DNS server on {}'.format(peer_ip))
+
+        if self.priv_key is None:
+            invoke_dns_cmd = self.run_dns_temp.substitute(usrname=self.usrname, remote_host=peer_ip)
+        else:
+            invoke_dns_cmd = self.run_dns_temp.substitute(key=self.priv_key, usrname=self.usrname, remote_host=peer_ip, dnsport=self.port, dnsname=self.name)
+        try:
+            remote_exe_output = check_output(invoke_dns_cmd, shell=True)
+
+        except CalledProcessError as exe_error:
+            print ('Error invoking DNS server at {}'.format(peer_ip))
+
+
+
+    def run_httpserver_at(self, peer_ip):
+        print ('Invoking HTTP server on {}'.format(peer_ip))
+
+        if self.priv_key is None:
+            invoke_dns_cmd = self.run_http_temp.substitute(usrname=self.usrname, remote_host=peer_ip)
+        else:
+            invoke_dns_cmd = self.run_http_temp.substitute(key=self.priv_key, usrname=self.usrname, remote_host=peer_ip, httpport=self.port, httporig=self.orig)
+        try:
+            remote_exe_output = check_output(invoke_dns_cmd, shell=True)
+
+        except CalledProcessError as exe_error:
+            print ('Error invoking HTTP server at {}'.format(peer_ip))
+
+
+if __name__=='__main__':
+    if len(sys.argv) == 1:
+        cdn_invoker = env_builder() 
+
+    elif len(sys.argv) == 3:
+        if sys.argv[1] == '-u':
+            cdn_invoker = env_builder(sys.argv[2])
+        else:
+            print ('Usage: ./runCDN\n       ./runCDN -u <username>\n       ./runCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+            sys.exit()
+
+
+
+    elif len(sys.argv) == 11:
+        if sys.argv[1] == '-p' and sys.argv[3] == '-o' and sys.argv[5] == '-n' and sys.argv[7] == '-u' and sys.argv[9] == '-i':
+
+            # fill in username and keyfile
+            cdn_invoker = env_builder(sys.argv[8], int(sys.argv[2]), sys.argv[4], sys.argv[6], sys.argv[10])
+
+        else:
+            print ('Usage: ./runCDN\n       ./runCDN -u <username>\n       ./runCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+            sys.exit()
+    else:
+        print ('Usage: ./runCDN\n       ./runCDN -u <username>\n       ./runCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+        sys.exit()
+
+    for peer in cdn_invoker.peers:
+        #cdn_invoker.install_libs_at(peer)
+        cdn_invoker.run_dnsserver_at(peer)
+        sleep(1)
+        cdn_invoker.run_httpserver_at(peer)

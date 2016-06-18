@@ -1,0 +1,64 @@
+#!/usr/bin/python2
+
+import sys
+from constants import *
+from utils import tcp_sock, udp_sock, tcp_connect, send_data, send_msg 
+
+# read a given file contains list of peer ips
+# formatted as one ip per line
+def read_all_peers(filename):
+    with open(filename, 'r') as hosts:
+        return map( (lambda str: str.strip()), hosts.readlines())
+
+
+# send exit command to HTTP server
+def tcp_exit(host, port):
+    cli_sock = tcp_sock()
+    if tcp_connect(cli_sock, host, port): 
+        send_data(cli_sock, EXIT_CMD)
+    cli_sock.close()
+
+
+# send exit command to DNS server
+def udp_exit(host, port):
+    cli_sock = udp_sock()
+    send_msg(cli_sock, EXIT_CMD, host, port)
+    cli_sock.close()
+
+
+if __name__=='__main__':
+    if len(sys.argv) == 1:
+        remote_port = PORT
+
+    elif len(sys.argv) == 3:
+        if sys.argv[1] != '-p':
+            print ('Usage: ./stopCDN\n       ./stopCDN -p <port>\n       ./stopCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+            sys.exit()
+        else:
+            remote_port = int(sys.argv[2])
+
+
+
+    elif len(sys.argv) == 11:
+        if sys.argv[1] == '-p' and sys.argv[3] == '-o' and sys.argv[5] == '-n' and sys.argv[7] == '-u' and sys.argv[9] == '-i':
+            remote_port = int(sys.argv[2])
+
+        else:
+            print ('Usage: ./stopCDN\n       ./stopCDN -p <port>\n       ./stopCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+            sys.exit()
+    else:
+        print ('Usage: ./stopCDN\n       ./stopCDN -p <port>\n       ./stopCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+        sys.exit()
+
+    peers = read_all_peers(HOSTS)
+
+    for peer in peers:
+        tcp_exit(peer, remote_port)
+        udp_exit(peer, remote_port)
+
+
+
+
+
+
+

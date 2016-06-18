@@ -1,0 +1,309 @@
+#!/usr/bin/python2
+
+import socket
+import random
+
+from subprocess import check_output, CalledProcessError
+from struct import unpack
+from utils import *
+from constants import *
+
+
+
+# Assume one question per query, only A record is handled
+# Flags, Questions, Answer RRs, Authority RRs, Additional RRs
+DNS_RESP_BEGIN = b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x01'
+
+# 0xc: pointer to name, 0x00c: name starting index 12
+ANSWER_BEGIN = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04'
+
+CP_CMD = 'cp {} {} > /dev/null 2>/dev/null'
+
+# After file is copied to each server, it is changed to a general name
+NBRS_FILE = './my_neighbors'
+
+# xx.xx.xx.xx.nbrs -> NBRS_FILE
+def rename_neighbor_file():
+    try:
+        cp_output = check_output(CP_CMD.format('./*.nbrs', NBRS_FILE), shell=True)
+    except CalledProcessError as exe_error:
+        print ('Warning: no neighbors list file found.')
+
+
+# default dns port is the same as http port
+
+# The DNS server will be called using:
+# ./dnsserver -p <port> -n <name> for customized port and hostname
+# ./dnsserver (on default port) 
+# for command dig @[DNS server IP]:[port]
+
+# where port is the port number that the DNS server will bind
+# name is the CDN-specific name that your server translates to
+# an IP.
+
+# In this case, cs5700cdn.example.com will be translated to 
+# one of the replica IP or the origin.
+
+# ./dnsserver -p [PORT_NUM] -n cs5700cdn.example.com => ...
+
+
+
+# The DNS server should dynamically resolve the IP address of cs5700cdn.example.com
+# It is resiponsible for maintaining cache dists among neighbors
+# for dynamic ip resolution
+class DNS_server:
+    def __init__(self, dns_port=PORT):
+        self.host = get_src_ip()
+        self.port = dns_port
+        self.peers = read_all_peers(HOSTS)
+
+        # {content_name : [list of neighbor ips that cached it]}
+        self.cache_dists = {}
+        self.neighbors = []
+        
+        # ips of peers that are better than origin:
+        # e.g. less geo distance:
+        # this is populated from a pre-assigned neighbors file
+        # after running init script
+        if os.path.isfile(NBRS_FILE):
+            self.neighbors = read_all_peers(NBRS_FILE)
+
+        #print ('List of my neighbors: ')
+        #print (self.neighbors)
+        self_buf_len = MAX_LEN
+
+    def setup_socket(self):
+        # establish socket and start listen for client lookup
+        try:
+            #self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.server = udp_sock()
+            self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server.bind((self.host, self.port))
+
+        except OSError as sock_error:
+            if self.server:
+                self.server.close()
+
+            print ('Listening socket in DNS server failed:')
+            print (sock_error.strerror)
+            sys.exit(sock_error.errno)
+
+
+    # bytes segment contains transaction id
+    def get_raw_id(self, dns_query):
+        return dns_query[0:2]
+
+
+    # find the ending index of Queries segment
+    def find_queries_end(self, dns_query):
+        # Queries segment starts from index 12
+        # find the end of name:
+        for i in range(13, len(dns_query)):
+            if dns_query[i] == 0x00:
+                break
+        return i
+
+
+    # bytes segment contains Queries(Name, Type, Class)
+    def get_raw_queries(self, dns_query):
+        i = self.find_queries_end(dns_query)
+        # segment ends at i+4
+        end_idx = i + 5
+        return dns_query[12:end_idx]
+
+
+    # bytes segment contains additional records
+    def get_raw_additional_records(self, dns_query):
+        i = self.find_queries_end(dns_query)
+        return dns_query[i+1:]
+
+
+    # returns id in decimal
+    def get_id(self, dns_query):
+        raw_id = dns_query[0:2]
+        return int.from_bytes(raw_id, byteorder='big')
+
+
+    # returns a string formatted target hostname
+    # this is used to lookup for ip addrs
+    def get_name(self, dns_query):
+        # Name filed in Queries starts from index 12
+        # ends at 0x00
+        name = ''
+        for i in range(13, len(dns_query)):
+            if dns_query[i] == 0x00:
+                break
+            elif dns_query[i] == 0x03:
+                name = name + '.'
+            else:
+                #print (type (dns_query[i]))
+                name = name + (dns_query[i])
+        return name
+
+
+    # build and returns Answers segment in bytes
+    def compose_answers(self, dns_query):
+        name = self.get_name(dns_query)
+        ip = self.get_dest_ip(name)
+        ip_in_hex = ip_to_bytes(ip)
+
+        #print (ip_in_hex)
+        return (ANSWER_BEGIN + ip_in_hex)
+
+
+    # given a domain name 'cs5700cdn.example.com'
+    # and a content file being requested 
+    # dynamically returns the ip addr of:
+    # best (nearest) neighbor who has the file
+    # if no neighbor has the file: redirect to origin
+    def get_dest_ip(self, name, content=None):
+
+        # no server located nearer than origin
+        if len(self.neighbors) == 0:
+            return ORIGIN_IP
+
+        # nothing to download
+        elif content is None:
+            return ORIGIN_IP
+        
+        # the requested content is cached at some neighbors
+        elif content in self.cache_dists:
+            # redirect to one of the neighbors that have the cache
+            neighbors = len(self.cache_dists[content])
+            # random select
+            idx = random.randint(0, neighbors-1)
+            return self.cache_dists[content][idx]
+
+        # the requested content is not cached at any of my neighbors
+        else:
+            return ORIGIN_IP
+
+
+
+
+    # returns a byte string as answer for dig command
+    # ID + ANSWER_BEGIN + Queries + Answers + Additional Record 
+    # among which only Answers needs to be built
+    def compose_dns_resp(self, dns_query):
+        id = self.get_raw_id(dns_query)
+        queries = self.get_raw_queries(dns_query)
+        answers = self.compose_answers(dns_query)
+        records = self.get_raw_additional_records(dns_query)
+        
+        complete_response = id + DNS_RESP_BEGIN + queries + answers + records
+        # this is not readable in python 2:
+        # print (complete_response)
+        return complete_response
+
+
+    def resp_to(self, dns_query):
+        dns_resp = self.compose_dns_resp(dns_query)
+        return dns_resp
+
+    
+    def update_cache_dists(self, cli_addr, cli_port, cache_name):
+        # if the sender is not my neighbor, ignore the msg
+        if cli_addr in self.neighbors:
+            if cli_port == UPDATE_PORT:
+                # cache update message
+                if cache_name in self.cache_dists:
+                    if cli_addr not in self.cache_dists[cache_name]:
+                        self.cache_dists[cache_name].append(cli_addr)
+                else:
+                    # init an one element list
+                    self.cache_dists[cache_name] = [cli_addr]
+
+            elif cli_port == DEL_PORT:
+                # cache delete message
+                if cache_name in self.cache_dists:
+                    if cli_addr in self.cache_dists[cache_name]:
+                        self.cache_dists[cache_name].remove(cli_addr)
+
+
+    
+    def run(self):
+        self.setup_socket()
+        running = True
+        
+        print ('DNS server running at:')
+        print (self.host, self.port)
+
+
+        while running:
+            # msg types:
+            # 0. exit command: request is a special string
+            # 1. dig command: request is a byte string in hex
+            # 2. cache update/delete message: request is a content file name
+            # 3. informal dns lookup: request is a hostname string 
+            request, cli_addr = self.server.recvfrom(MAX_LEN)
+
+            # cache update msgs from remote hosts (client ip, udp port)
+            if cli_addr[1] == UPDATE_PORT or cli_addr[1] == DEL_PORT:
+
+                # only update from neighbors: ignore localhost, peers that 
+                # are not within my neighbors
+                if cli_addr[0] != self.host and cli_addr[0] in self.neighbors:
+                    print ('Cache update message.')
+                    # cache dists update: no need to reply, just update cache_dists
+                    self.update_cache_dists(cli_addr[0], cli_addr[1], request)
+
+            # if came from localhost: 
+            # 1. HTTP server query: resolve a neighbor ip
+            elif cli_addr[0] == self.host and cli_addr[1] == INNER_QUERY_PORT:
+                print ('Local query from HTTP server.')
+                print (request)
+                answer = self.get_dest_ip(CDN_NAME, request)
+                print (answer)
+                self.server.sendto(answer, cli_addr)
+
+            # 2. Dig
+            else:
+                # print ('Lookup request: ' + request.decode('utf-8'))
+                print ('DNS dig request.')
+                # print (request)
+                answer = self.resp_to(request)
+
+                #print ('Dig command')
+                #print (type(request))
+                #print (request)
+                
+                self.server.sendto(answer, cli_addr)
+                #print ('DNS answer: ' + answer.decode('utf-8'))
+            
+
+            
+
+if __name__ == '__main__':
+    # ./dnsserver
+    # ./dnsserver -p <port> -n <name>
+    
+    rename_neighbor_file()
+
+    if len(sys.argv) == 5:
+        if sys.argv[1] == '-p' and sys.argv[3] == '-n':
+            name = sys.argv[4] 
+            customized_port = int(sys.argv[2])
+            
+            server = DNS_server(customized_port)
+            
+            print(server.port, server.get_dest_ip(name))
+            
+            clean_up(customized_port, 'udp')
+            server.run()
+
+        else:
+            print ('Usage: ./dnsserver\n       ./dnsserver -p <port> -n <name>')
+            sys.exit()
+
+    elif len(sys.argv) == 1:
+        clean_up(PORT, 'udp')
+        server = DNS_server()
+        server.run()
+
+    else:
+        print ('Usage: ./dnsserver\n       ./dnsserver -p <port> -n <name>')
+        sys.exit()
+
+
+
+

@@ -1,0 +1,227 @@
+#!/usr/bin/python2
+
+import os
+import sys
+import time
+import operator
+
+# daemon lib exit the server
+#import daemon
+
+from string import Template
+from utils import *
+from constants import *
+
+
+BACKLOG = 5
+REDIRECT_CMD_TEMP = Template('HTTP/1.1 302 Found\nLocation: http://$host:$port$content\n\n')
+
+
+
+# The HTTP server will be called using
+# ./httpserver -p <port> -o <origin>
+# ./httpserver (on default port, serving default origin)
+
+# This code is responsible for: 
+# 1. running a listening TCP socket for HTTP GET requests
+# 2. parse the request to identify the file content requested
+# 3. fetch the file from: 
+#    - local cache (10MB)
+#    - origin server (if it is not cached locally)
+# 4. deliver the file through sending from socket
+# 5. update local cache for popular contents
+
+
+# Clients from servers located all over the world will send HTTP get requests 
+# to fetch a file from (the resolved IP address of) cs5700cdn.example.com.
+
+
+
+class HTTP_server:
+    def __init__(self, http_port=PORT, orig_host=ORIGIN_IP):
+        self.host = get_src_ip()
+        self.port = http_port
+        self.orig = orig_host 
+
+        # total number of bytes cached 
+        self.cached = 0
+        # cache name and size 
+        self.cache_dict = {}
+
+        self.peers = read_all_peers(HOSTS)
+        self.buf_len = MAX_LEN
+
+        print ('Initializing HTTP server:')
+        print (self.host, self.port)
+    
+
+    # in case not init start: some cache exist already
+    def scan_cache(self):
+        if os.path.isdir(CACHE_DIR):
+            # scan this directory without including CACHE_DIR
+            os.chdir(CACHE_DIR)
+            self.cached, self.cache_dict = traverse_dir(os.path.relpath(os.getcwd()))
+            os.chdir(WORK_DIR)
+
+
+    def setup_socket(self):
+        # establish socket and start listen for client connection
+        try:
+            #self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server = tcp_sock()
+            self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server.bind((self.host, self.port))
+            self.server.listen(BACKLOG)
+
+        except OSError as sock_error:
+            if self.server:
+                self.server.close()
+
+            print ('Listening socket in HTTP server failed:')
+            print (sock_error.strerror)
+            sys.exit(sock_error.errno)
+    
+
+    # send a UDP message from alternative port to dnsservers at all peers
+    def send_cache_update_msg(self, content_name, port):
+        snd_sock = udp_sock()
+        udp_bind(snd_sock, port)
+
+        msg = content_name
+        for peer in self.peers:
+            send_msg(snd_sock, msg, peer)
+
+
+    def update_cache(self, content_name, data_len, data):
+        data_path = CACHE_DIR + content_name
+        current_cache_size = self.cached
+
+        if (current_cache_size + data_len) >= CACHE_LIMIT:
+            # delete some other cache:
+
+            # min size
+            target_file = sorted(self.cache_dict.items(), key=operator.itemgetter(1))[0][0]
+            target_path = CACHE_DIR + target_file
+            os.remove(target_path)
+
+            # update cache size after removal
+            self.cached -= os.path.getsize(target_path)
+            send_cache_update_msg(data_path, DEL_PORT)
+
+        else:
+            # write to cache:
+            write_file(data_path, data)
+
+            # update cache size after download
+            self.cached += data_len
+            print ('{} number of bytes cached.'.format(self.cached))
+            
+            # update cache dict
+            self.cache_dict[content_name] = data_len
+            self.send_cache_update_msg(content_name, UPDATE_PORT)
+
+
+    # an informal dns query with content requested
+    # return an ip address
+    def query_dns(self, content_name, port=INNER_QUERY_PORT):
+        resolved_ip = ORIGIN_IP
+
+        snd_sock = udp_sock()
+        udp_bind(snd_sock, port)
+        msg = content_name
+
+        send_msg(snd_sock, msg, self.host)
+        resolved_ip = recv_msg(snd_sock)
+        
+        print (resolved_ip)
+        return resolved_ip
+
+
+    def resp_to(self, get_req):
+        cache_hit = False
+        #data = HTTP404
+        host, file = parse_get(get_req)
+        print ('File {} is requested.'.format(file))
+
+        file_path = CACHE_DIR + file
+        # cached locally: 
+        # deliver the file
+        if os.path.isfile(file_path):
+            data = file_to_str(file_path)
+            cache_hit = True
+
+        # not cached locally:
+        # consult dnsserver and send a redirection
+        else:
+            peer_ip = self.query_dns(file)
+            if peer_ip == ORIGIN_IP:
+                data = REDIRECT_CMD_TEMP.substitute(host=ORIGIN_IP, port=ORIGIN_PORT, content=file)
+            else:
+                data = REDIRECT_CMD_TEMP.substitute(host=peer_ip, port=PORT, content=file)
+
+
+        # content filename, data contained, if cached
+        return [file, data, cache_hit]
+
+
+
+    def run(self):
+        # service start
+        self.setup_socket()
+        running = True
+        while running: 
+            client, address = self.server.accept() 
+            request = client.recv(MAX_LEN) 
+
+            if request: 
+                # quit upon receive an exit command
+                if request == EXIT_CMD:
+                    print ('Received exit signal.')
+                    sys.exit()
+
+                # this is a cached page or redirection
+                content, data, cached = self.resp_to(request)
+                client.sendall(data) 
+
+                # update cache if needed
+                if not cached:
+                    # update cache 
+                    data = fetch_page(ORIGIN, ORIGIN_PORT, content)
+                    stat_code = int(get_status_code(data))
+
+                    if stat_code == 200:
+                        # this includes sending a Cache Update Message to all peers
+                        self.update_cache(content, len(data), data)
+            else:
+                client.close()
+
+
+
+if __name__ == '__main__':
+    clean_up(PORT, 'tcp')
+
+    clean_up(UPDATE_PORT, 'udp')
+    clean_up(DEL_PORT, 'udp')
+    clean_up(INNER_QUERY_PORT, 'udp')
+    
+    if len(sys.argv) == 1:
+        server = HTTP_server()
+        server.scan_cache()
+        server.run()
+
+    elif len(sys.argv) == 5:
+        if sys.argv[1] == '-p' and sys.argv[3] == '-o':
+            server = HTTP_server( int(sys.argv[2]), sys.argv[4])
+            server.scan_cache()
+            server.run()
+
+        else:
+            print ('Usage: ./httpserver\n       ./httpserver -p <port> -o <origin>')
+            sys.exit()
+
+    else:
+        print ('Usage: ./httpserver\n       ./httpserver -p <port> -o <origin>')
+        sys.exit()
+
+
+

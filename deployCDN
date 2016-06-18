@@ -1,0 +1,100 @@
+#!/usr/bin/python2
+
+import os
+import sys
+from constants import *
+from string import Template
+from subprocess import check_output, CalledProcessError 
+
+# ./deployCDN: 
+
+# 1. run make all && sh setup.sh at base server to install libs
+# 2. run python init.py to generate .nbrs files
+# 3. copy necessary code to remote peer
+
+CORE_FILES = './hosts ./constants.py ./utils.py ./dnsserver ./httpserver ./nohup.sh ./{}'
+
+# set the filename for neighbor list based on ip addrs
+def get_neighbor_list(ip):
+    digits = ip.split('.')
+    prefix = ''.join([ (digit + '.') for digit in digits])
+    return prefix + 'nbrs'
+
+
+# read a given file contains list of peer ips
+# formatted as one ip per line
+def read_all_peers(filename):
+    with open(filename, 'r') as hosts:
+        return map( (lambda str: str.strip()), hosts.readlines())
+
+
+# read hosts file, copy cdn code to replica servers
+class code_dispatcher:
+    # this is the username that has been set up 
+    # with password-less login on all replica servers
+    def __init__(self, user='lxylinki', key=None):
+        self.usrname = user
+        self.priv_key = key
+
+        #self.local_setup_cmd = 'make all && sh ./setup.sh && python init.py'
+        self.local_setup_cmd = 'make all'
+        
+        if key is not None:
+            self.copy_temp = Template('scp -i $keyfile $files $usrname@$remote_host:/home/$usrname/')
+        else:
+            self.copy_temp = Template('scp $files $usrname@$remote_host:/home/$usrname/')
+        self.peers = read_all_peers(HOSTS)
+        # this directory must contain all necessary files that need to be copied to remote host
+        self.src_dir = './'
+    
+
+    # copy necessary files to the home directory in remote host
+    def copy_code(self, peer_ip):
+        # this is a uniq file for each server
+        my_neighbor_list = get_neighbor_list(peer_ip)
+
+        if self.priv_key is not None:
+            scp_cmd = self.copy_temp.substitute(keyfile=self.priv_key, files=CORE_FILES.format(my_neighbor_list), usrname = self.usrname, remote_host=peer_ip)
+        else:
+            scp_cmd = self.copy_temp.substitute(files=CORE_FILES.format(my_neighbor_list), usrname = self.usrname, remote_host=peer_ip)
+        try:
+            scp_output = check_output(scp_cmd, shell=True)
+        except CalledProcessError as exe_error:
+            print ('Error when copy code to {}.'.format(peer_ip))
+
+
+
+if __name__=='__main__':
+    if len(sys.argv) == 1:
+        copier = code_dispatcher()
+
+    elif len(sys.argv) == 3:
+        if sys.argv[1] == '-u':
+            copier = code_dispatcher(sys.argv[2], None)
+        else:
+            print ('Usage: ./deployCDN\n       ./deployCDN -u <username>\n       ./deployCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+            sys.exit()
+
+
+
+    elif len(sys.argv) == 11:
+        if sys.argv[1] == '-p' and sys.argv[3] == '-o' and sys.argv[5] == '-n' and sys.argv[7] == '-u' and sys.argv[9] == '-i':
+            # fill in username and keyfile
+            copier = code_dispatcher(sys.argv[8], sys.argv[10])
+        else:
+            print ('Usage: ./deployCDN\n       ./deployCDN -u <username>\n       ./deployCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+            sys.exit()
+    else:
+        print ('Usage: ./deployCDN\n       ./deployCDN -u <username>\n       ./deployCDN -p <port> -o <origin> -n <name> -u <username> -i <keyfile>')
+        sys.exit()
+
+
+    # password and key-less login is set up for this project
+    for peer in copier.peers:
+        print ('Deploying to server {} ...'.format(peer))
+        copier.copy_code(peer)
+    print ('All CDN code are deployed. Exit.')
+
+
+
+
