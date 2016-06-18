@@ -6,11 +6,7 @@ from constants import *
 from string import Template
 from subprocess import check_output, CalledProcessError 
 
-# ./deployCDN: 
 
-# 1. run make all && sh setup.sh at base server to install libs
-# 2. run python init.py to generate .nbrs files
-# 3. copy necessary code to remote peer
 
 CORE_FILES = './hosts ./constants.py ./utils.py ./dnsserver ./httpserver ./nohup.sh ./{}'
 
